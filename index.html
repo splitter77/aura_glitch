@@ -66,6 +66,20 @@
   let particles = [];
   let lastT = 0;
 
+  // ---------- quit the App Clip at the end ----------
+  // Same trick as fsbrowser/web/demos/quit-appclip.html: an oversized Bluetooth
+  // timeout overflows in the bridge and the App Clip closes. Only in the App Clip,
+  // never in Aura Browser. Bluetooth must be on and allowed.
+  const QUIT_DELAY = 2500;   // let the final fade finish first (ms)
+  async function quitAppClip() {
+    if (!window.Aura) return;
+    try {
+      const caps = await Promise.resolve(Aura.capabilities && Aura.capabilities());
+      if (!caps || !caps.appClip) return;
+      await Aura.peer.join({ room: 'quit-' + Date.now(), timeout: 1e300 });
+    } catch (e) { /* Bluetooth off or refused: stay on the end screen */ }
+  }
+
   // ---------- noise ----------
   const hash = (i, j) => {
     const s = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
@@ -429,7 +443,7 @@
       const done = drawBurn(e, dt);
       drawParticles(e, dt);
       glitchPass(intensity);
-      if (done) { state = 'ended'; endedAt = now; }
+      if (done) { state = 'ended'; endedAt = now; setTimeout(quitAppClip, QUIT_DELAY); }
       return;
     }
 
