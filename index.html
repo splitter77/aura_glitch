@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>Aura Glitch</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    color: #fff;
+  }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  .overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px; text-align: center;
+    padding: 24px; box-sizing: border-box; background: #000; z-index: 2;
+    transition: opacity .4s;
+  }
+  .overlay.hidden { opacity: 0; pointer-events: none; }
+  .overlay.transparent { background: transparent; }
+  .title { font-size: 13px; letter-spacing: .4em; text-transform: uppercase; opacity: .5; }
+  button {
+    font: inherit; font-size: 18px; color: #fff; background: #111;
+    border: 1px solid #444; border-radius: 14px; padding: 18px 28px; cursor: pointer;
+  }
+  button:active { background: #222; }
+  button.secondary { font-size: 14px; padding: 10px 18px; background: transparent; border-color: #333; opacity: .7; }
+  .msg { font-size: 14px; opacity: .7; min-height: 1.2em; max-width: 320px; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="overlay" id="start">
+  <div class="title">Aura Glitch</div>
+  <button id="pasteBtn">Paste image from clipboard</button>
+  <div class="msg" id="msg">Copy an image, then tap the button (or ⌘V / Ctrl+V)</div>
+  <button class="secondary" id="fileBtn">…or choose an image</button>
+  <input type="file" id="file" accept="image/*">
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const startEl = document.getElementById('start');
+  const msgEl = document.getElementById('msg');
+  const fileInput = document.getElementById('file');
+
+  const DELAY = 5000;        // delay after touch before the chaos (ms)
+  const BURN_START = 0.6;    // burn starts X s after the glitch begins
+  const BURN_TIME = 13;      // time for the fire to climb the whole screen (s)
+
+  let W = 0, H = 0, dpr = 1;
+  let img = null;
+  let base, chR, chG, chB, noiseCv, scanCv;
+  let channelsOk = false;
+  let state = 'start';       // start | waiting | armed | chaos | ended
+  let armedAt = 0, chaosAt = 0, endedAt = 0;
+  let particles = [];
+  let lastT = 0;
+
+  // ---------- noise ----------
+  const hash = (i, j) => {
+    const s = Math.sin(i * 127.1 + j * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  };
+  const smooth = f => f * f * (3 - 2 * f);
+  function noise2(x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = smooth(x - xi), yf = smooth(y - yi);
+    const a = hash(xi, yi), b = hash(xi + 1, yi);
+    const c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+    return (a + (b - a) * xf) + ((c + (d - c) * xf) - (a + (b - a) * xf)) * yf;
+  }
+  function fbm(x, y) {
+    let v = 0, amp = 0.5, f = 1;
+    for (let o = 0; o < 4; o++) { v += amp * noise2(x * f, y * f); f *= 2.1; amp *= 0.5; }
+    return v; // ~0..1
+  }
+  const rnd = (a, b) => a + Math.random() * (b - a);
+
+  // ---------- setup ----------
+  function makeCanvas(w, h) {
+    const c = document.createElement('canvas'); c.width = w; c.height = h; return c;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = Math.round(window.innerWidth * dpr);
+    H = Math.round(window.innerHeight * dpr);
+    canvas.width = W; canvas.height = H;
+    if (img) prepare();
+    buildTextures();
+  }
+
+  function buildTextures() {
+    // grain
+    noiseCv = makeCanvas(256, 256);
+    const nctx = noiseCv.getContext('2d');
+    const nd = nctx.createImageData(256, 256);
+    for (let i = 0; i < nd.data.length; i += 4) {
+      const v = Math.random() * 255;
+      nd.data[i] = nd.data[i + 1] = nd.data[i + 2] = v; nd.data[i + 3] = 255;
+    }
+    nctx.putImageData(nd, 0, 0);
+    // scanlines
+    scanCv = makeCanvas(4, Math.max(2, Math.round(3 * dpr)));
+    const sctx = scanCv.getContext('2d');
+    sctx.fillStyle = 'rgba(0,0,0,0.35)';
+    sctx.fillRect(0, 0, 4, Math.max(1, Math.round(dpr)));
+  }
+
+  function prepare() {
+    base = makeCanvas(W, H);
+    const b = base.getContext('2d');
+    b.fillStyle = '#000'; b.fillRect(0, 0, W, H);
+    // cover
+    const s = Math.max(W / img.width, H / img.height);
+    const dw = img.width * s, dh = img.height * s;
+    b.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+
+    // separate R / G / B channels for chromatic aberration
+    channelsOk = false;
+    try {
+      const src = b.getImageData(0, 0, W, H);
+      const mk = (keep) => {
+        const c = makeCanvas(W, H), cx = c.getContext('2d');
+        const d = cx.createImageData(W, H), o = d.data, s2 = src.data;
+        for (let i = 0; i < o.length; i += 4) {
+          o[i] = keep === 0 ? s2[i] : 0;
+          o[i + 1] = keep === 1 ? s2[i + 1] : 0;
+          o[i + 2] = keep === 2 ? s2[i + 2] : 0;
+          o[i + 3] = 255;
+        }
+        cx.putImageData(d, 0, 0);
+        return c;
+      };
+      chR = mk(0); chG = mk(1); chB = mk(2);
+      channelsOk = true;
+    } catch (e) { /* tainted image (external URL): skip channel separation */ }
+  }
+
+  // ---------- image loading ----------
+  function loadFromBlob(blob) {
+    const url = URL.createObjectURL(blob);
+    loadFromUrl(url, true);
+  }
+  function loadFromUrl(url, isBlob) {
+    const im = new Image();
+    if (!isBlob && !url.startsWith('data:')) im.crossOrigin = 'anonymous';
+    im.onload = () => {
+      img = im; prepare(); goWaiting();
+    };
+    im.onerror = () => {
+      if (im.crossOrigin) { // retry without CORS
+        const im2 = new Image();
+        im2.onload = () => { img = im2; prepare(); goWaiting(); };
+        im2.onerror = () => setMsg("Unable to load this image.");
+        im2.src = url;
+      } else setMsg("Unable to load this image.");
+    };
+    im.src = url;
+  }
+  function setMsg(t) { msgEl.textContent = t; }
+
+  async function pasteFromClipboard() {
+    if (!navigator.clipboard) { setMsg("Clipboard unavailable here — use ⌘V or choose an image."); return; }
+    try {
+      if (navigator.clipboard.read) {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const type = item.types.find(t => t.startsWith('image/'));
+          if (type) { loadFromBlob(await item.getType(type)); return; }
+        }
+        for (const item of items) {
+          if (item.types.includes('text/plain')) {
+            const txt = (await (await item.getType('text/plain')).text()).trim();
+            if (/^(https?:|data:image)/i.test(txt)) { loadFromUrl(txt); return; }
+          }
+        }
+      } else if (navigator.clipboard.readText) {
+        const txt = (await navigator.clipboard.readText()).trim();
+        if (/^(https?:|data:image)/i.test(txt)) { loadFromUrl(txt); return; }
+      }
+      setMsg("No image in the clipboard. Copy an image and try again.");
+    } catch (e) {
+      setMsg("Clipboard access denied — use ⌘V / Ctrl+V or choose an image.");
+    }
+  }
+
+  document.getElementById('pasteBtn').addEventListener('click', pasteFromClipboard);
+  document.getElementById('fileBtn').addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) loadFromBlob(fileInput.files[0]);
+    fileInput.value = '';
+  });
+  window.addEventListener('paste', (e) => {
+    if (state !== 'start' && state !== 'waiting' && state !== 'ended') return;
+    const items = e.clipboardData ? [...e.clipboardData.items] : [];
+    const imgItem = items.find(i => i.type.startsWith('image/'));
+    if (imgItem) { e.preventDefault(); loadFromBlob(imgItem.getAsFile()); return; }
+    const txt = e.clipboardData && e.clipboardData.getData('text/plain').trim();
+    if (txt && /^(https?:|data:image)/i.test(txt)) { e.preventDefault(); loadFromUrl(txt); }
+  });
+
+  // ---------- states ----------
+  function goWaiting() {
+    state = 'waiting';
+    particles = [];
+    startEl.classList.add('hidden');
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.drawImage(base, 0, 0);
+  }
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (state === 'waiting') { state = 'armed'; armedAt = performance.now(); }
+  });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // ---------- rendering ----------
+  function drawBase(intensity) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    // screen shake
+    const shake = intensity * 14 * dpr * (Math.random() < 0.35 ? 1 : 0.2);
+    const sx = rnd(-shake, shake), sy = rnd(-shake, shake);
+
+    if (channelsOk && Math.random() < 0.25 + 0.7 * intensity) {
+      // chromatic aberration in a random direction
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'lighter';
+      const amt = (4 + 40 * intensity * Math.random()) * dpr;
+      const a1 = Math.random() * Math.PI * 2, a2 = a1 + Math.PI + rnd(-0.8, 0.8);
+      ctx.drawImage(chR, sx + Math.cos(a1) * amt, sy + Math.sin(a1) * amt);
+      ctx.drawImage(chG, sx, sy);
+      ctx.drawImage(chB, sx + Math.cos(a2) * amt, sy + Math.sin(a2) * amt);
+      ctx.globalCompositeOperation = 'source-over';
+    } else {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+      ctx.drawImage(base, sx, sy);
+      if (!channelsOk && Math.random() < intensity) {
+        ctx.globalCompositeOperation = 'screen'; ctx.globalAlpha = 0.5;
+        ctx.drawImage(base, sx + rnd(-30, 30) * dpr * intensity, sy + rnd(-10, 10) * dpr);
+        ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function edgeY(x, frontY, t) {
+    const amp = 70 * dpr;
+    const n = fbm(x / (260 * dpr), t * 0.35);
+    const flick = noise2(x / (40 * dpr), t * 4) * 14 * dpr;
+    return frontY - (n - 0.5) * 2 * amp - flick;
+  }
+
+  function drawBurn(e, dt) {
+    const p = Math.max(0, (e - BURN_START) / BURN_TIME);
+    if (p <= 0) return false;
+    const extra = 220 * dpr;
+    const frontY = H + 90 * dpr - Math.pow(p, 1.25) * (H + extra);
+    const step = Math.max(4, Math.round(6 * dpr));
+    const pts = [];
+    for (let x = -step; x <= W + step; x += step) pts.push([x, edgeY(x, frontY, e)]);
+
+    const pathFrom = (offset, jitterScale) => {
+      ctx.beginPath();
+      ctx.moveTo(-step, H + 10);
+      for (let i = 0; i < pts.length; i++) {
+        const [x, y] = pts[i];
+        const j = jitterScale ? (noise2(x / (90 * dpr), e * 0.5 + 9) - 0.5) * jitterScale : 0;
+        ctx.lineTo(x, y - offset + j);
+      }
+      ctx.lineTo(W + step, H + 10);
+      ctx.closePath();
+    };
+
+    // scorching / browning above the front
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = 'rgba(150,95,45,0.55)'; pathFrom(120 * dpr, 80 * dpr); ctx.fill();
+    ctx.fillStyle = 'rgba(110,55,15,0.6)';  pathFrom(55 * dpr, 40 * dpr); ctx.fill();
+    ctx.fillStyle = 'rgba(60,25,5,0.75)';   pathFrom(20 * dpr, 16 * dpr); ctx.fill();
+
+    // charred area
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = '#070403'; pathFrom(0, 0); ctx.fill();
+
+    // glowing embers in the char, just below the front
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < pts.length; i += 2) {
+      const [x, y] = pts[i];
+      const glow = noise2(x / (30 * dpr), e * 3);
+      if (glow > 0.62) {
+        ctx.fillStyle = `rgba(255,${60 + glow * 80 | 0},0,${(glow - 0.6) * 1.2})`;
+        ctx.fillRect(x, y + rnd(4, 30) * dpr, step * 1.5, rnd(2, 6) * dpr);
+      }
+    }
+
+    // fire edge
+    const strokeEdge = (lw, color) => {
+      ctx.lineWidth = lw; ctx.strokeStyle = color;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) i ? ctx.lineTo(pts[i][0], pts[i][1]) : ctx.moveTo(pts[i][0], pts[i][1]);
+      ctx.stroke();
+    };
+    ctx.lineJoin = 'round';
+    const f = rnd(0.85, 1.15);
+    strokeEdge(34 * dpr * f, 'rgba(255,60,0,0.18)');
+    strokeEdge(16 * dpr * f, 'rgba(255,110,10,0.45)');
+    strokeEdge(7 * dpr * f, 'rgba(255,180,40,0.8)');
+    strokeEdge(2.5 * dpr, 'rgba(255,245,200,0.95)');
+
+    // particle emission (rising embers)
+    if (frontY > -extra) {
+      const n = Math.round(W / (14 * dpr) * Math.min(1, dt * 60));
+      for (let k = 0; k < n; k++) {
+        const pt = pts[(Math.random() * pts.length) | 0];
+        if (particles.length < 700) particles.push({
+          x: pt[0], y: pt[1], vx: rnd(-0.6, 0.6) * dpr, vy: rnd(-3.2, -0.8) * dpr,
+          life: 1, decay: rnd(0.008, 0.03), size: rnd(0.8, 2.6) * dpr, seed: Math.random() * 100
+        });
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    return frontY < -extra * 0.6; // everything is burned
+  }
+
+  function drawParticles(t, dt) {
+    ctx.globalCompositeOperation = 'lighter';
+    const k = dt * 60;
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const q = particles[i];
+      q.vx += (noise2(q.seed, t * 2) - 0.5) * 0.4 * dpr * k;
+      q.x += q.vx * k; q.y += q.vy * k;
+      q.vy -= 0.02 * dpr * k;
+      q.life -= q.decay * k;
+      if (q.life <= 0 || q.y < -20) { particles.splice(i, 1); continue; }
+      const g = 120 + 135 * q.life | 0;
+      ctx.fillStyle = `rgba(255,${g},${40 * q.life | 0},${q.life})`;
+      ctx.fillRect(q.x, q.y, q.size * 1.6, q.size * 1.6);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function glitchPass(intensity) {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    // shifted horizontal slices
+    const nh = Math.floor(rnd(0, 3 + 16 * intensity));
+    for (let i = 0; i < nh; i++) {
+      const sy = rnd(0, H), sh = rnd(2, 10 + 120 * intensity * Math.random()) * dpr;
+      const dx = rnd(-1, 1) * (20 + 260 * intensity) * dpr;
+      ctx.drawImage(canvas, 0, sy, W, sh, dx, sy, W, sh);
+    }
+    // shifted vertical slices
+    const nv = Math.floor(rnd(0, 1 + 10 * intensity));
+    for (let i = 0; i < nv; i++) {
+      const sx = rnd(0, W), sw = rnd(2, 8 + 90 * intensity * Math.random()) * dpr;
+      const dy = rnd(-1, 1) * (20 + 220 * intensity) * dpr;
+      ctx.drawImage(canvas, sx, 0, sw, H, sx, dy, sw, H);
+    }
+    // blocks displaced in all directions
+    const nb = Math.floor(rnd(0, 1 + 8 * intensity));
+    for (let i = 0; i < nb; i++) {
+      const bw = rnd(20, 260) * dpr, bh = rnd(8, 120) * dpr;
+      const sx = rnd(0, W - bw), sy = rnd(0, H - bh);
+      const a = Math.random() * Math.PI * 2, d = rnd(10, 200) * dpr * intensity;
+      ctx.drawImage(canvas, sx, sy, bw, bh, sx + Math.cos(a) * d, sy + Math.sin(a) * d, bw, bh);
+    }
+    // saturated color bands / inversion
+    if (Math.random() < 0.08 + 0.25 * intensity) {
+      ctx.globalCompositeOperation = 'difference';
+      ctx.fillStyle = '#fff';
+      if (Math.random() < 0.15) ctx.fillRect(0, 0, W, H);
+      else ctx.fillRect(0, rnd(0, H), W, rnd(4, 80) * dpr);
+    }
+    if (Math.random() < 0.15 * intensity) {
+      ctx.globalCompositeOperation = 'lighter';
+      const cols = ['rgba(255,0,80,0.35)', 'rgba(0,255,200,0.3)', 'rgba(60,80,255,0.35)'];
+      ctx.fillStyle = cols[(Math.random() * 3) | 0];
+      if (Math.random() < 0.5) ctx.fillRect(0, rnd(0, H), W, rnd(10, 160) * dpr);
+      else ctx.fillRect(rnd(0, W), 0, rnd(10, 120) * dpr, H);
+    }
+    // grain + scanlines
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.globalAlpha = 0.12 + 0.25 * intensity;
+    const pat = ctx.createPattern(noiseCv, 'repeat');
+    ctx.save();
+    ctx.translate(rnd(0, 256), rnd(0, 256));
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = pat; ctx.fillRect(-256, -256, W / dpr + 512, H / dpr + 512);
+    ctx.restore();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.5 + 0.5 * intensity;
+    ctx.fillStyle = ctx.createPattern(scanCv, 'repeat');
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min(0.05, (now - (lastT || now)) / 1000);
+    lastT = now;
+
+    if (state === 'armed') {
+      const waited = now - armedAt;
+      if (waited >= DELAY) {
+        state = 'chaos'; chaosAt = now; particles = [];
+      } else {
+        ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+        ctx.drawImage(base, 0, 0);
+        // one or two micro-jolts right before the explosion
+        if (waited > DELAY - 700 && Math.random() < 0.12) glitchPass(0.15);
+        return;
+      }
+    }
+
+    if (state === 'chaos') {
+      const e = (now - chaosAt) / 1000;
+      const intensity = Math.min(1, 0.35 + e / 5) * (Math.random() < 0.1 ? 1.4 : 1);
+      drawBase(intensity);
+      const done = drawBurn(e, dt);
+      drawParticles(e, dt);
+      glitchPass(intensity);
+      if (done) { state = 'ended'; endedAt = now; }
+      return;
+    }
+
+    if (state === 'ended') {
+      const e = (now - endedAt) / 1000;
+      ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+      ctx.fillStyle = '#050302'; ctx.fillRect(0, 0, W, H);
+      drawParticles(e, dt);
+      if (e < 2.5) glitchPass(Math.max(0, 0.6 - e / 4));
+    }
+  }
+
+  let rt;
+  window.addEventListener('resize', () => {
+    clearTimeout(rt);
+    rt = setTimeout(() => { resize(); if (state === 'waiting' && base) ctx.drawImage(base, 0, 0); }, 150);
+  });
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
